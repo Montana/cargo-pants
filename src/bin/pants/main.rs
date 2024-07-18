@@ -52,14 +52,17 @@ fn main() {
 
             common::print_dev_dependencies_info(include_dev_dependencies);
 
-            audit(
+            if let Err(e) = audit(
                 toml_file.to_string_lossy().to_string(),
                 oss_index_api_key,
                 loud,
                 !no_color,
                 include_dev_dependencies,
                 ignore_file,
-            );
+            ) {
+                eprintln!("Error: {}", e);
+                process::exit(1);
+            }
         }
     }
 }
@@ -71,43 +74,34 @@ fn audit(
     enable_color: bool,
     include_dev: bool,
     ignore_file: PathBuf,
-) -> ! {
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut parser = ParseCargoToml::new(toml_file_path.clone(), include_dev);
-    let packages = match parser.get_packages() {
-        Ok(packages) => packages,
-        Err(e) => {
-            println!("{}", e);
-            process::exit(1);
-        }
-    };
+    let packages = parser.get_packages()?;
 
-    let api_key = match oss_index_api_key {
-        Some(oss_index_api_key) => oss_index_api_key,
-        None => {
-            info!("Warning: missing optional 'OSS_INDEX_API_KEY'");
-            String::new()
-        }
-    };
+    let api_key = oss_index_api_key.unwrap_or_else(|| {
+        info!("Warning: missing optional 'OSS_INDEX_API_KEY'");
+        String::new()
+    });
 
     let client = OSSIndexClient::new(api_key);
-    let mut coordinates: Vec<Coordinate> = Vec::new();
-    for chunk in packages.chunks(128) {
-        coordinates.append(&mut client.post_coordinates(chunk.to_vec()));
-    }
-
-    let mut non_vulnerable_package_count: u32 = 0;
-    let mut vulnerable_package_count: u32 = 0;
+    let coordinates: Vec<Coordinate> = packages
+        .chunks(128)
+        .flat_map(|chunk| client.post_coordinates(chunk.to_vec()))
+        .collect();
 
     // Ignore vulns
-    filter_vulnerabilities(&mut coordinates, ignore_file);
+    let mut filtered_coordinates = coordinates.clone();
+    filter_vulnerabilities(&mut filtered_coordinates, ignore_file);
 
-    for coordinate in &coordinates {
-        if coordinate.has_vulnerabilities() {
-            vulnerable_package_count += 1;
-        } else {
-            non_vulnerable_package_count += 1;
-        }
-    }
+    let (vulnerable_package_count, non_vulnerable_package_count) = filtered_coordinates
+        .iter()
+        .fold((0, 0), |(vuln, non_vuln), coord| {
+            if coord.has_vulnerabilities() {
+                (vuln + 1, non_vuln)
+            } else {
+                (vuln, non_vuln + 1)
+            }
+        });
 
     let mut stdout = stdout();
     if verbose_output {
@@ -118,42 +112,38 @@ fn audit(
 
         write_package_output(
             &mut stdout,
-            &coordinates,
+            &filtered_coordinates,
             non_vulnerable_package_count,
             false,
             enable_color,
             None,
             &parser,
-        )
-        .expect("Error writing non-vulnerable packages to output");
-    } else if !verbose_output && vulnerable_package_count > 0 {
+        )?;
+    } else if vulnerable_package_count > 0 {
         write_package_output(
             &mut stdout,
-            &coordinates,
+            &filtered_coordinates,
             vulnerable_package_count,
             true,
             enable_color,
             None,
             &parser,
-        )
-        .expect("Error writing vulnerable packages to output");
+        )?;
     }
 
     // show a summary so folks know we are not pantless
-    println!(
-        "{}",
-        get_summary_message(coordinates.len() as u32, vulnerable_package_count)
-    );
+    println!("{}", get_summary_message(coordinates.len() as u32, vulnerable_package_count));
 
-    match vulnerable_package_count {
-        0 => process::exit(0),
-        _ => process::exit(3),
+    if vulnerable_package_count == 0 {
+        Ok(())
+    } else {
+        process::exit(3);
     }
 }
 
 fn write_package_output(
     output: &mut dyn Write,
-    coordinates: &Vec<Coordinate>,
+    coordinates: &[Coordinate],
     package_count: u32,
     vulnerable: bool,
     enable_color: bool,
@@ -192,9 +182,10 @@ fn write_package_output(
         }
         if vulnerable {
             let vulnerability_count = coordinate.vulnerabilities.len();
-            let plural_text = match vulnerability_count {
-                1 => "vulnerability",
-                _ => "vulnerabilities",
+            let plural_text = if vulnerability_count == 1 {
+                "vulnerability"
+            } else {
+                "vulnerabilities"
             };
 
             let text = format!("{} known {} found", vulnerability_count, plural_text);
@@ -214,7 +205,7 @@ fn write_package_output(
             }
 
             println!("Inverse Dependency graph");
-            assert!(parser.print_the_graph(coordinate.purl.clone()).is_ok());
+            parser.print_the_graph(coordinate.purl.clone())?;
             println!();
         }
     }
@@ -222,18 +213,18 @@ fn write_package_output(
 }
 
 fn style_purl(vulnerable: bool, purl: String) -> StyledObject<String> {
-    match vulnerable {
-        true => style(purl).red().bold(),
-        false => style(purl).green(),
+    if vulnerable {
+        style(purl).red().bold()
+    } else {
+        style(purl).green()
     }
 }
 
 fn get_summary_message(component_count: u32, vulnerability_count: u32) -> String {
-    let message = format!(
+    format!(
         "\nAudited Dependencies: {}\nVulnerable Dependencies: {}\n",
         component_count, vulnerability_count
-    );
-    return message;
+    )
 }
 
 fn check_pants(n: &str) -> ! {
@@ -292,11 +283,11 @@ mod tests {
         coordinates.push(coordinate_three);
 
         let package_count = coordinates.len() as u32;
-        return (coordinates, package_count);
+        (coordinates, package_count)
     }
 
-    fn convert_output(output: &Vec<u8>) -> &str {
-        std::str::from_utf8(output.as_slice()).expect("Could not convert output to UTF-8")
+    fn convert_output(output: &[u8]) -> &str {
+        std::str::from_utf8(output).expect("Could not convert output to UTF-8")
     }
 
     #[test]
@@ -336,9 +327,9 @@ mod tests {
         )
         .expect("Failed to write package output");
         assert_eq!(
-          convert_output(&package_output),
-          "\nVulnerable Dependencies\n\n[1/3] coord one purl-1vuln\n1 known vulnerability found\n\nVulnerability Title: coord1-vuln1 title\n╭─────────────┬───╮\n│ ID          │   │\n├─────────────┼───┤\n│ Description │   │\n├─────────────┼───┤\n│ CVSS Score  │ 0 │\n├─────────────┼───┤\n│ CVSS Vector │   │\n├─────────────┼───┤\n│ Reference   │   │\n╰─────────────┴───╯\n\n\n[2/3] coord two purl-3vulns\n3 known vulnerabilities found\n\nVulnerability Title: coord2-vuln1 title\n╭─────────────┬───╮\n│ ID          │   │\n├─────────────┼───┤\n│ Description │   │\n├─────────────┼───┤\n│ CVSS Score  │ 0 │\n├─────────────┼───┤\n│ CVSS Vector │   │\n├─────────────┼───┤\n│ Reference   │   │\n╰─────────────┴───╯\n\n\n\nVulnerability Title: coord2-vuln3 title\n╭─────────────┬───╮\n│ ID          │   │\n├─────────────┼───┤\n│ Description │   │\n├─────────────┼───┤\n│ CVSS Score  │ 0 │\n├─────────────┼───┤\n│ CVSS Vector │   │\n├─────────────┼───┤\n│ Reference   │   │\n╰─────────────┴───╯\n\n\n"
-      );
+            convert_output(&package_output),
+            "\nVulnerable Dependencies\n\n[1/3] coord one purl-1vuln\n1 known vulnerability found\n\nVulnerability Title: coord1-vuln1 title\n╭─────────────┬───╮\n│ ID          │   │\n├─────────────┼───┤\n│ Description │   │\n├─────────────┼───┤\n│ CVSS Score  │ 0 │\n├─────────────┼───┤\n│ CVSS Vector │   │\n├─────────────┼───┤\n│ Reference   │   │\n╰─────────────┴───╯\n\n\n[2/3] coord two purl-3vulns\n3 known vulnerabilities found\n\nVulnerability Title: coord2-vuln1 title\n╭─────────────┬───╮\n│ ID          │   │\n├─────────────┼───┤\n│ Description │   │\n├─────────────┼───┤\n│ CVSS Score  │ 0 │\n├─────────────┼───┤\n│ CVSS Vector │   │\n├─────────────┼───┤\n│ Reference   │   │\n╰─────────────┴───╯\n\n\n\nVulnerability Title: coord2-vuln3 title\n╭─────────────┬───╮\n│ ID          │   │\n├─────────────┼───┤\n│ Description │   │\n├─────────────┼───┤\n│ CVSS Score  │ 0 │\n├─────────────┼───┤\n│ CVSS Vector │   │\n├─────────────┼───┤\n│ Reference   │   │\n╰─────────────┴───╯\n\n\n"
+        );
     }
 
     #[test]
